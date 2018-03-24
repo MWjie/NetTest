@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <errno.h>
 #include "Rio.h"
 
@@ -38,7 +39,8 @@ ssize_t rio_writen(int fd, void *usrbuf, size_t n)
     char *bufp = usrbuf;
 
     while (nleft > 0) {
-        if ((nwritten = write(fd, bufp, nleft)) <= 0) {
+//        if ((nwritten = write(fd, bufp, nleft)) <= 0) { //×èÈû
+        if ((nwritten = send(fd, bufp, nleft, 0)) <= MSG_DONTWAIT) { //·Ç×èÈû
             if (errno == EINTR) { /* Interrupted by sig handler return */
                 nwritten = 0;     /* and call write() again */
             } else {
@@ -63,12 +65,14 @@ static ssize_t rio_read(rio_t *rp, char *usrbuf, size_t n)
     int cnt;
 
     while (rp->rio_cnt <= 0) {   /* Refill if buf is empty */
-        rp->rio_cnt = read(rp->rio_fd, rp->rio_buf, 
-                            sizeof(rp->rio_buf));
+//        rp->rio_cnt = read(rp->rio_fd, rp->rio_buf, sizeof(rp->rio_buf)); //×èÈû
+        rp->rio_cnt = recv(rp->rio_fd, rp->rio_buf, sizeof(rp->rio_buf), MSG_DONTWAIT); //·Ç×èÈû
+//        rp->rio_cnt = recv(rp->rio_fd, rp->rio_buf, sizeof(rp->rio_buf), 0); //·Ç×èÈû
         if (rp->rio_cnt < 0) {
-            if (errno != EINTR) {    /* Interrupted by sig handler return */
-                return -1;
-            }
+//            if (errno != EINTR) {    /* Interrupted by sig handler return */
+//                return -1;
+//            }
+           return 0;
         }
         else if (rp->rio_cnt == 0) { /* EOF */
             return 0;
@@ -106,8 +110,9 @@ ssize_t rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen)
             else {
                 break;    /* EOF, some data was read */
             }
-        } else
+        } else {
             return -1;    /* Error */
+        }
     }
     *bufp = 0;
     return n;
@@ -122,9 +127,9 @@ ssize_t rio_readnb(rio_t *rp, void *usrbuf, size_t n)
     while (nleft > 0) {
         if ((nread = rio_read(rp, bufp, nleft)) < 0) {
             if (errno == EINTR) {   /* Interrupted by sig handler return */
-                return 0;           /* Call read() again */   
+                return 0;           /* Call read() again */
             } else {
-                return -1;          /* errno set by read() */ 
+                return -1;          /* errno set by read() */
             }
         } 
         else if (nread == 0) {

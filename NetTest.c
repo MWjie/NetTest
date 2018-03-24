@@ -48,7 +48,7 @@ typedef struct LinkNode_Net {
 #define MAXLINE         ( 256 )         //发送最大数据字节
 #define CLOCKID			( CLOCK_REALTIME )
 
-int RX_TIME_OUT_MS = 1000;      //超时时间
+int RX_TIME_OUT_MS;      //超时时间
 LinkNode_Net NetMapLink;        //状态表
 char Flag_Start = 0;            //线程启动标志
 
@@ -88,7 +88,8 @@ void timer_thread(union sigval v)
 int main(int argc, char const *argv[])
 {
     int i, *pid;
-    unsigned short start_port, num_port;
+    unsigned short start_port, num_port, bundrate;
+    unsigned int tx_count;
     char dest_ip[16];
     stNetPacket *pLinkNode;
     pLinkNode_Net plink = &NetMapLink;
@@ -101,13 +102,15 @@ int main(int argc, char const *argv[])
 	char tmp_printf[4096];
     char tmp_str[512];
     
-	if (argc != 4) {
-        fprintf(stderr, "usage: %s [ip] [port] [num]\n", argv[0]);
+	if (argc != 5) {
+        fprintf(stderr, "usage: %s [ip] [port] [num] [bundrate]\n", argv[0]);
         exit(-1);
 	}
     strcpy(dest_ip, argv[1]); //目标ip
     start_port = (unsigned short)atoi(argv[2]); //起始端口号
     num_port = (unsigned short)atoi(argv[3]);   //端口号总数
+    bundrate = (unsigned short)atoi(argv[4]);   //波特率
+    RX_TIME_OUT_MS = (1*256*10*8*1000)/bundrate;
     if (num_port == 0) {
         fprintf(stderr, "port number must > 0\n");
         exit(1);
@@ -187,8 +190,11 @@ int main(int argc, char const *argv[])
 
         while (1) {
             plinkStatus = plink->pNetStatus;
-            plinkStatus->accuracy = (float)(plinkStatus->rx_lens - plinkStatus->err_lens - plinkStatus->lost_lens)
-                                        /(float)plinkStatus->rx_lens*100;
+            if (plinkStatus->IP_info.port % 2) {
+                tx_count = plinkStatus->tx_lens;
+            }
+            plinkStatus->accuracy = (float)(tx_count - plinkStatus->err_lens - plinkStatus->lost_lens)
+                                        /(float)tx_count*100;
             sprintf(tmp_str, "%-4d       ", plinkStatus->IP_info.port);
 			strcat(tmp_printf, tmp_str);
             if (plinkStatus->accuracy < 100) {
@@ -244,6 +250,7 @@ void *thread(void *vargp)
 int open_clientfd(char *hostname, unsigned short port)
 {
     int clientfd;
+    int flags;
     struct hostent *hp;
     struct sockaddr_in serveraddr;
     
@@ -258,6 +265,9 @@ int open_clientfd(char *hostname, unsigned short port)
     serveraddr.sin_family = AF_INET;
     bcopy((char *)hp->h_addr_list[0], (char *)&serveraddr.sin_addr.s_addr, hp->h_length);
     serveraddr.sin_port = htons(port);
+
+    flags = fcntl(clientfd, F_GETFL, 0);
+    fcntl(clientfd, flags | O_NONBLOCK);
 
     /* Establish a connection with the server */
     if (connect(clientfd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
@@ -289,20 +299,30 @@ int insertNetNode(stNetPacket *pLinkNode)
 void echo(int masterORslave, stNetPacket *pNetStatus)
 {
     size_t n;
-    char rx_buf[MAXLINE];
-    char tx_buf[MAXLINE];
+    unsigned char rx_buf[MAXLINE];
+    unsigned char tx_buf[MAXLINE];
     rio_t rio;
+//    fd_set fdRead;
+//    int rc = 0;
+//    struct timeval tv;  
+//    tv.tv_sec  = 5;
+//    tv.tv_usec = 0;
     int i, count;
     char is_frame, is_errframe;
     stNetPacket *pNet = pNetStatus;
+
     memset(rx_buf, 0, sizeof(rx_buf));
     for (i = 0; i < MAXLINE; i++) {
         tx_buf[i] = i;
     }
 
     while (1) {
+        is_errframe = 0;
+        is_frame = 0;
+        count = 0;
+        
         if (masterORslave == 0) { //主设备
-            rio_writen(pNet->IP_info.connfd, tx_buf, n);
+            rio_writen(pNet->IP_info.connfd, tx_buf, sizeof(tx_buf));
             __sync_lock_test_and_set(&(pNet->timeout), 0);
             pNet->tx_pkgs++;
             pNet->tx_lens +=256;
@@ -310,10 +330,26 @@ void echo(int masterORslave, stNetPacket *pNetStatus)
             while (1) {
                 if (pNet->timeout > RX_TIME_OUT_MS) {
                     pNet->lost_lens += 256;
+                    pNet->lost_pkgs++;
                     is_errframe = 1;
-                    continue;
+                    __sync_lock_test_and_set(&(pNet->timeout), 0);
+                    break;
                 }
-                if ((n = rio_readlineb(&rio, rx_buf, MAXLINE)) > 0) {
+/*                
+                FD_ZERO(&fdRead);
+                FD_SET(rio.rio_fd, &fdRead);
+                tv.tv_sec  = 5;
+                tv.tv_usec = 0;
+                rc = select(0, &fdRead, NULL, NULL, &tv);
+                if (rc == 0) { //超时
+                    pNet->lost_lens += 256;
+                    is_errframe = 1;
+                    break;
+                } 
+*/
+                //if(pNet->IP_info.port == 5101)
+//                    printf("%d\n", pNet->IP_info.port);
+                if ((n = rio_readnb(&rio, rx_buf, MAXLINE)) > 0) {
                     __sync_lock_test_and_set(&(pNet->timeout), 0);
                     break;
                 }
@@ -321,7 +357,13 @@ void echo(int masterORslave, stNetPacket *pNetStatus)
             }
             for (i = 0; i < n; i++) {
                 if (rx_buf[i] == 0x00) {
-                    count = 0;
+//                    if (is_frame == 1) {
+//                        is_errframe = 1;
+//                        pNet->err_lens += n;
+//                        pNet->rx_lens  += n;
+//                        break;
+//                    }
+//                    count = 0;
                     is_frame = 1;
                 }
                 if (is_frame && count < sizeof(rx_buf)) {
@@ -332,48 +374,86 @@ void echo(int masterORslave, stNetPacket *pNetStatus)
                     count++;
                 }
                 pNet->rx_lens++;
-                if (rx_buf[i] == 0xff) {
+                if (i == 0xff && rx_buf[i] == 0xff) {
                     pNet->rx_pkgs++;
+                } 
+                if (!is_frame && i >= n - 1) {
+                    pNet->err_lens += n;
+                    is_errframe = 1;
                 }
-                if (is_errframe) {
-                    pNet->err_pkgs++;
-                }
+            }
+            if (is_errframe) {
+                pNet->err_pkgs++;
             }
             if (pNet->st_exit == 1) {
                 exit(1);
             }
-            sleep(1);
+            usleep(100);
         } 
         else { //从设备
-            if (pNet->timeout > RX_TIME_OUT_MS) {
+            rio_readinitb(&rio, pNet->IP_info.connfd);
+            while (1) {
+                if (pNet->timeout > RX_TIME_OUT_MS) {
+                    pNet->lost_lens += 256;
+                    pNet->lost_pkgs++;
+                    is_errframe = 1;
+                    __sync_lock_test_and_set(&(pNet->timeout), 0);
+                    break;
+                }
+/*
+            FD_ZERO(&fdRead);
+            FD_SET(rio.rio_fd, &fdRead);
+            tv.tv_sec  = 5;
+            tv.tv_usec = 0;
+            rc = select(0, &fdRead, NULL, NULL, &tv);
+            if (rc == 0) { //超时
                 pNet->lost_lens += 256;
                 is_errframe = 1;
                 continue;
             }
-            rio_readinitb(&rio, pNet->IP_info.connfd);
-            if ((n = rio_readlineb(&rio, rx_buf, MAXLINE)) > 0) {
-                __sync_lock_test_and_set(&(pNet->timeout), 0);
-                for (i = 0; i < n; i++) {
-                    if (rx_buf[i] == 0x00) {
-                        count = 0;
-                        is_frame = 1;
-                    }
-                    if (is_frame && count < sizeof(rx_buf)) {
-                        if (rx_buf[i] != count) {
-                            pNet->err_lens++;
-                            is_errframe = 1;
-                        }
-                        count++;
-                    }
-                    pNet->rx_lens++;
-                    if (rx_buf[i] == 0xff) {
-                        pNet->rx_pkgs++;
-                    }
-                    if (is_errframe) {
-                        pNet->err_pkgs++;
-                    }
+*/
+//            if(pNet->IP_info.port == 5101)
+//                printf("%d\n", pNet->IP_info.port);
+                if ((n = rio_readnb(&rio, rx_buf, MAXLINE)) > 0) {
+                    __sync_lock_test_and_set(&(pNet->timeout), 0);
+                    break;
                 }
-                rio_writen(pNet->IP_info.connfd, tx_buf, n);
+                usleep(1000);
+            }
+
+            for (i = 0; i < n; i++) {
+                if (rx_buf[i] == 0x00) {
+//                    if (is_frame == 1) {
+//                        is_errframe = 1;
+//                        pNet->err_lens += n;
+//                        pNet->rx_lens  += n;
+//                        break;
+//                    }
+//                    count = 0;
+                    is_frame = 1;
+                }
+                if (is_frame && count < sizeof(rx_buf)) {
+                    if (rx_buf[i] != count) {
+                        pNet->err_lens++;
+                        is_errframe = 1;
+                    }
+                    count++;
+                }
+                
+                pNet->rx_lens++;
+                if (i == 0xff && rx_buf[i] == 0xff) {
+                    pNet->rx_pkgs++;
+                }
+                if (!is_frame && i >= n - 1) {
+                    pNet->err_lens += n;
+                    is_errframe = 1;
+                }
+            }
+            if (is_errframe) {
+                pNet->err_pkgs++;
+            }
+            if (n >= MAXLINE-1) {
+                rio_writen(pNet->IP_info.connfd, tx_buf, sizeof(tx_buf));
                 __sync_lock_test_and_set(&(pNet->timeout), 0);
                 pNet->tx_pkgs++;
                 pNet->tx_lens += 256;
@@ -381,7 +461,7 @@ void echo(int masterORslave, stNetPacket *pNetStatus)
             if (pNet->st_exit == 1) {
                 exit(1);
             }
-            usleep(1000);
+            usleep(100);
         }
     }
 }
